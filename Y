@@ -1,0 +1,237 @@
+& {
+    $ErrorActionPreference = 'Continue'
+
+    # 1. Locate D:\ (or Ventoy/Ventory USB drive)
+    $TargetDrive = if (Test-Path "D:\") { "D:\" } else {
+        $vol = Get-Volume | Where-Object { $_.FileSystemLabel -match 'ventoy|ventory' -and $_.DriveLetter } | Select-Object -First 1
+        if ($vol) { "$($vol.DriveLetter):\" } else { $null }
+    }
+    if (-not $TargetDrive -or -not (Test-Path $TargetDrive)) {
+        throw "Could not find D:\ or a Ventoy/Ventory USB drive. Plug it in and retry."
+    }
+
+    $OutRoot = Join-Path $TargetDrive "PL_Audit"
+    $TextDir = Join-Path $OutRoot "01_SAFE_TEXT_REPORTS"
+    $BinDir  = Join-Path $OutRoot "02_QUARANTINE_BINARIES"
+    New-Item -ItemType Directory -Path $TextDir, $BinDir -Force | Out-Null
+
+    Write-Host "[*] Saving audit evidence to $OutRoot ..." -ForegroundColor Cyan
+
+    # 2. Auto-detect Project Lightning install path, AppData, Installer, and Steam path
+    $PLCandidates = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Project Lightning"),
+        (Join-Path $env:LOCALAPPDATA "Programs\project-lightning"),
+        (Join-Path $env:ProgramFiles "Project Lightning"),
+        (Join-Path ${env:ProgramFiles(x86)} "Project Lightning"),
+        "C:\Project Lightning"
+    )
+    Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match 'Lightning' -and $_.InstallLocation } |
+        ForEach-Object { $PLCandidates += $_.InstallLocation }
+
+    $PLDir = $PLCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique -First 1
+
+    $PLDataDirs = @(
+        (Join-Path $env:APPDATA "project-lightning-data"),
+        (Join-Path $env:LOCALAPPDATA "project-lightning-data")
+    ) | Where-Object { Test-Path $_ } | Select-Object -Unique
+
+    $SteamDir = (Get-ItemProperty "HKCU:\Software\Valve\Steam" -ErrorAction SilentlyContinue).SteamPath
+    if (-not $SteamDir -or -not (Test-Path $SteamDir)) {
+        $SteamDir = (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam" -ErrorAction SilentlyContinue).InstallPath
+    }
+    if (-not $SteamDir -or -not (Test-Path $SteamDir)) {
+        $SteamDir = "C:\Program Files (x86)\Steam"
+    }
+    $SteamDir = $SteamDir.Replace('/', '\').TrimEnd('\')
+
+    # 3. Binary Digital Signatures + SHA-256 Hashes (Project Lightning root+resources & Steam root+bin ONLY)
+    $BinTargets = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    if ($PLDir) {
+        Get-ChildItem -Path $PLDir -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.exe','.dll','.node' } |
+            ForEach-Object { $BinTargets.Add($_) }
+
+        $PLRes = Join-Path $PLDir "resources"
+        if (Test-Path $PLRes) {
+            Get-ChildItem -Path $PLRes -Recurse -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in '.exe','.dll','.node','.asar' } |
+                ForEach-Object { $BinTargets.Add($_) }
+        }
+    }
+    if (Test-Path $SteamDir) {
+        Get-ChildItem -Path $SteamDir -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.exe','.dll' } |
+            ForEach-Object { $BinTargets.Add($_) }
+
+        $SteamBin = Join-Path $SteamDir "bin"
+        if (Test-Path $SteamBin) {
+            Get-ChildItem -Path $SteamBin -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in '.exe','.dll' } |
+                ForEach-Object { $BinTargets.Add($_) }
+        }
+    }
+    foreach ($d in $PLDataDirs) {
+        Get-ChildItem -Path $d -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.exe','.dll','.node','.ps1','.bat','.vbs','.cmd','.py' } |
+            ForEach-Object { $BinTargets.Add($_) }
+    }
+    Get-ChildItem -Path "$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop" -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match 'Lightning' -and $_.Extension -in '.exe','.zip','.rar','.7z' } |
+        ForEach-Object { $BinTargets.Add($_) }
+
+    $SigCsv = Join-Path $TextDir "02_Binary_Signatures_And_Hashes.csv"
+    $BinRecords = foreach ($f in ($BinTargets | Sort-Object FullName -Unique)) {
+        $sig  = Get-AuthenticodeSignature $f.FullName -ErrorAction SilentlyContinue
+        $hash = (Get-FileHash $f.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+        [PSCustomObject]@{
+            Name         = $f.Name
+            FullPath     = $f.FullName
+            SizeBytes    = $f.Length
+            LastModified = $f.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            SigStatus    = if ($sig) { $sig.Status } else { "Error" }
+            Signer       = if ($sig -and $sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "NONE" }
+            SHA256       = $hash
+        }
+    }
+    $BinRecords | Export-Csv -Path $SigCsv -NoTypeInformation -Encoding UTF8
+
+    # 4. Quarantine suspicious/non-Valve binaries cleanly (appends .quarantine)
+    function Copy-SafeQuarantine($srcPath, $tag) {
+        if (-not (Test-Path $srcPath)) { return }
+        $sub = Join-Path $BinDir $tag
+        New-Item -ItemType Directory -Path $sub -Force | Out-Null
+        $dest = Join-Path $sub ((Split-Path $srcPath -Leaf) + ".quarantine")
+        try { Copy-Item -LiteralPath $srcPath -Destination $dest -Force -ErrorAction Stop } catch {}
+    }
+
+    foreach ($rec in $BinRecords) {
+        $isValve  = $rec.Signer -match 'Valve'
+        $isValid  = $rec.SigStatus -eq 'Valid'
+        $isSteamRoot = $rec.FullPath.StartsWith($SteamDir, [System.StringComparison]::OrdinalIgnoreCase)
+
+        if ($isSteamRoot -and (-not $isValid -or -not $isValve)) {
+            Copy-SafeQuarantine $rec.FullPath "Steam_NonValve_Or_Unsigned"
+        } elseif (-not $isSteamRoot -and ($rec.Name -match 'Lightning|OpenSteam|dwmapi|xinput|7z' -or -not $isValid -or $rec.FullPath -match 'app\.asar\.unpacked|project-lightning-data|resources\\binaries')) {
+            Copy-SafeQuarantine $rec.FullPath "ProjectLightning_Binaries"
+        }
+    }
+
+    # 5. Dump all Python scripts (.py) inside Project Lightning & AppData
+    $PyOut = Join-Path $TextDir "03_Python_Scripts_Dump.txt"
+    $PyFiles = @()
+    if ($PLDir) { $PyFiles += Get-ChildItem -Path $PLDir -Recurse -Filter *.py -File -Force -ErrorAction SilentlyContinue }
+    foreach ($d in $PLDataDirs) { $PyFiles += Get-ChildItem -Path $d -Recurse -Filter *.py -File -Force -ErrorAction SilentlyContinue }
+    $PyText = foreach ($p in ($PyFiles | Sort-Object FullName -Unique)) {
+        "==================================================`r`nFILE: $($p.FullName) ($($p.Length) bytes)`r`n==================================================`r`n" +
+        (Get-Content -LiteralPath $p.FullName -Raw -ErrorAction SilentlyContinue) + "`r`n"
+    }
+    if ($PyText) { $PyText | Set-Content -Path $PyOut -Encoding UTF8 } else { "No .py files found." | Set-Content -Path $PyOut -Encoding UTF8 }
+
+    # 6. Dump Steam .lua / .st scripts + list manifests & appmanifests
+    $LuaOut = Join-Path $TextDir "04_Steam_Lua_And_Manifest_List.txt"
+    $LuaLines = [System.Collections.Generic.List[string]]::new()
+    foreach ($sub in @("config\stplug-in", "config\lua")) {
+        $p = Join-Path $SteamDir $sub
+        if (Test-Path $p) {
+            $LuaLines.Add("=== DIR: $p ===")
+            Get-ChildItem -Path $p -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                $LuaLines.Add("--- FILE: $($_.Name) ($($_.Length) bytes | $($_.LastWriteTime)) ---")
+                if ($_.Length -lt 200KB) {
+                    $LuaLines.Add((Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue))
+                }
+            }
+        }
+    }
+    foreach ($sub in @("depotcache", "config\depotcache", "steamapps")) {
+        $p = Join-Path $SteamDir $sub
+        if (Test-Path $p) {
+            $LuaLines.Add("`r`n=== LIST: $p ===")
+            Get-ChildItem -Path $p -File -Force -ErrorAction SilentlyContinue |
+                Select-Object Name, Length, LastWriteTime |
+                Format-Table -AutoSize | Out-String -Width 4096 |
+                ForEach-Object { $LuaLines.Add($_) }
+        }
+    }
+    $LuaLines | Set-Content -Path $LuaOut -Encoding UTF8
+
+    # 7. project-lightning-data inventory (skipping Chromium cache bloat)
+    $DataInvCsv = Join-Path $TextDir "07_ProjectLightningData_Inventory.csv"
+    $DataItems = foreach ($d in $PLDataDirs) {
+        Get-ChildItem -Path $d -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\(Cache|Code Cache|GPUCache|DawnGraphiteCache|DawnWebGPUCache|Service Worker|IndexedDB)\\' } |
+            Select-Object FullName, Length, Extension, LastWriteTime
+    }
+    $DataItems | Export-Csv -Path $DataInvCsv -NoTypeInformation -Encoding UTF8
+
+    # 8. Running Processes & Active Network Connections
+    $ProcOut = Join-Path $TextDir "05_Running_Processes_And_Netstat.txt"
+    $ProcReport = [System.Collections.Generic.List[string]]::new()
+    $ProcReport.Add("=== RUNNING PROCESSES ===")
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine |
+        Format-List | Out-String -Width 4096 | ForEach-Object { $ProcReport.Add($_) }
+    $ProcReport.Add("=== ACTIVE TCP CONNECTIONS ===")
+    Get-NetTCPConnection -ErrorAction SilentlyContinue |
+        Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess |
+        Format-Table -AutoSize | Out-String -Width 4096 | ForEach-Object { $ProcReport.Add($_) }
+    $ProcReport | Set-Content -Path $ProcOut -Encoding UTF8
+
+    # 9. Windows Defender Exclusions & Persistence Checks
+    $SecOut = Join-Path $TextDir "06_Persistence_Startup_And_Defender.txt"
+    $SecReport = [System.Collections.Generic.List[string]]::new()
+    $SecReport.Add("=== WINDOWS DEFENDER EXCLUSIONS ===")
+    try {
+        $mp = Get-MpPreference -ErrorAction Stop
+        $SecReport.Add("ExclusionPath:      $($mp.ExclusionPath -join '; ')")
+        $SecReport.Add("ExclusionProcess:   $($mp.ExclusionProcess -join '; ')")
+        $SecReport.Add("ExclusionExtension: $($mp.ExclusionExtension -join '; ')")
+    } catch {
+        $SecReport.Add("Could not read Get-MpPreference (run as Admin or Defender disabled): $($_.Exception.Message)")
+    }
+    $SecReport.Add("`r`n=== REGISTRY RUN / STARTUP KEYS ===")
+    foreach ($rk in @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    )) {
+        if (Test-Path $rk) {
+            $SecReport.Add("[$rk]")
+            (Get-ItemProperty $rk -ErrorAction SilentlyContinue) | Out-String -Width 4096 | ForEach-Object { $SecReport.Add($_) }
+        }
+    }
+    $SecReport.Add("=== NON-MICROSOFT SCHEDULED TASKS ===")
+    Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object { $_.TaskPath -notmatch '^\\Microsoft\\' -and $_.State -ne 'Disabled' } |
+        Select-Object TaskName, TaskPath, State, @{N='Actions';E={($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' | '}} |
+        Format-List | Out-String -Width 4096 | ForEach-Object { $SecReport.Add($_) }
+    $SecReport | Set-Content -Path $SecOut -Encoding UTF8
+
+    # 10. Executive Summary File
+    $UnsignedOrNonValve = $BinRecords | Where-Object { $_.SigStatus -ne 'Valid' -or ($_.FullPath.StartsWith($SteamDir, 'OrdinalIgnoreCase') -and $_.Signer -notmatch 'Valve') }
+    $SummaryOut = Join-Path $TextDir "01_Summary.txt"
+    @(
+        "=== PROJECT LIGHTNING BURNER PC TRIAGE SUMMARY ==="
+        "Timestamp      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        "Project Dir    : $PLDir"
+        "AppData Dirs   : $($PLDataDirs -join ', ')"
+        "Steam Dir      : $SteamDir"
+        "Total Binaries : $($BinRecords.Count)"
+        "Flagged Binaries (Unsigned or Non-Valve in Steam): $(@($UnsignedOrNonValve).Count)"
+        ""
+        "--- FLAGGED BINARIES ---"
+        ($UnsignedOrNonValve | Select-Object Name, SigStatus, Signer, SHA256, FullPath | Format-Table -AutoSize | Out-String -Width 4096)
+        "--- PYTHON FILES CAPTURED ---"
+        (($PyFiles | Select-Object -ExpandProperty FullName) -join "`r`n")
+        ""
+        "--- NEXT STEP ---"
+        "1. Open 01_SAFE_TEXT_REPORTS\03_Python_Scripts_Dump.txt & 06_Persistence_Startup_And_Defender.txt"
+        "2. Check SHA256 hashes from 02_Binary_Signatures_And_Hashes.csv (or 02_QUARANTINE_BINARIES) on VirusTotal"
+    ) | Set-Content -Path $SummaryOut -Encoding UTF8
+
+    Write-Host "`nDONE! Open: $SummaryOut" -ForegroundColor Green
+    Get-Content $SummaryOut
+}
